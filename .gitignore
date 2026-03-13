@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+state/
+.tmp.driveupload/
+profiles/datasmart_master.json
+
+.env
+.DS_Store

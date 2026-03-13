@@ -1,0 +1,22 @@
+{
+  "profile_id": "default",
+  "project_path": ".",
+  "telegram_bot_token_env": "TELEGRAM_BOT_TOKEN",
+  "allowed_chat_ids": [],
+  "codex_bin": "codex",
+  "codex_global_args": [],
+  "codex_exec_args": [
+    "--skip-git-repo-check"
+  ],
+  "codex_color_mode": "always",
+  "poll_timeout_seconds": 25,
+  "startup_telegram_message_enabled": false,
+  "startup_telegram_message_text": "Bridge started.\nProfile: {profile_id}\nThread: {thread_id}",
+  "thread_title": "default",
+  "telegram_intermediate_updates": false,
+  "telegram_format_mode": "html",
+  "telegram_force_summary": true,
+  "telegram_summary_max_chars": 1400,
+  "telegram_summary_max_lines": 24,
+  "telegram_progress_min_interval_seconds": 1.0
+}
