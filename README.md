@@ -66,8 +66,9 @@ Important keys:
 - `allowed_chat_ids` - empty list means "allow any chat".
 - `codex_bin` - CLI executable name (`codex` recommended).
 - `codex_global_args`, `codex_exec_args` - extra Codex args.
-- `codex_sandbox_mode` - optional Codex sandbox mode per profile: `read-only` | `workspace-write` | `danger-full-access`.
-- `codex_permissions` - alias for `codex_sandbox_mode`; value `full-access` is accepted and mapped to `danger-full-access`.
+- `codex_permissions` - optional Codex sandbox mode per profile: `read-only` | `workspace-write` | `danger-full-access` (value `full-access` is accepted and mapped to `danger-full-access`).
+- `codex_approval_policy` - optional approval mode: `untrusted` | `on-failure` | `on-request` | `never`. If omitted and `codex_permissions=danger-full-access`, bridge defaults to `never`.
+- `codex_web_search` - optional boolean. Enables CLI `--search` (web tool). If omitted and `codex_permissions=danger-full-access`, bridge defaults to `true`.
 - `thread_title` - optional thread title; bridge applies it via `/rename` and prefixes outgoing Telegram messages with `[thread_title]`.
 
 Default profile is portable and uses:

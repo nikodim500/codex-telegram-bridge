@@ -32,6 +32,7 @@ ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 DEFAULT_TG_SUMMARY_MAX_CHARS = 1400
 DEFAULT_TG_SUMMARY_MAX_LINES = 24
 DEFAULT_TG_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+ALLOWED_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
 
 
 class BridgeError(RuntimeError):
@@ -226,16 +227,28 @@ class Bridge:
 
         self.codex_global_args: list[str] = [str(x) for x in self.profile.get("codex_global_args", [])]
         self.codex_exec_args: list[str] = [str(x) for x in self.profile.get("codex_exec_args", [])]
+        self.codex_exec_prefix_args: list[str] = []
         self.codex_color_mode = str(self.profile.get("codex_color_mode") or "always").strip().lower()
         if self.codex_color_mode not in {"always", "never", "auto"}:
             raise BridgeError("Unsupported codex_color_mode. Use always|never|auto.")
-        self.codex_sandbox_mode = self._resolve_codex_sandbox_mode()
-        if self.codex_sandbox_mode:
-            if self._has_sandbox_arg(self.codex_global_args):
+        self.codex_permissions_mode = self._resolve_codex_permissions_mode()
+        if self.codex_permissions_mode:
+            if self._has_sandbox_arg(self.codex_global_args) or self._has_sandbox_arg(self.codex_exec_args):
                 raise BridgeError(
-                    "Use either profile key codex_sandbox_mode/codex_permissions or --sandbox in codex_global_args, not both."
+                    "Use either profile key codex_permissions or --sandbox in codex_global_args/codex_exec_args, not both."
                 )
-            self.codex_global_args.extend(["--sandbox", self.codex_sandbox_mode])
+            self.codex_exec_prefix_args.extend(["--sandbox", self.codex_permissions_mode])
+        self.codex_approval_policy = self._resolve_codex_approval_policy()
+        if self.codex_approval_policy:
+            if self._has_approval_arg(self.codex_global_args):
+                raise BridgeError(
+                    "Use either profile key codex_approval_policy or --ask-for-approval in codex_global_args, not both."
+                )
+            self.codex_global_args.extend(["--ask-for-approval", self.codex_approval_policy])
+
+        self.codex_web_search = self._resolve_codex_web_search()
+        if self.codex_web_search and not self._has_search_arg(self.codex_global_args):
+            self.codex_global_args.append("--search")
 
         self.poll_timeout = int(self.profile.get("poll_timeout_seconds", 25))
 
@@ -360,10 +373,13 @@ class Bridge:
 
         return command_name
 
-    def _resolve_codex_sandbox_mode(self) -> str | None:
-        raw = self.profile.get("codex_sandbox_mode")
-        if raw is None:
-            raw = self.profile.get("codex_permissions")
+    def _resolve_codex_permissions_mode(self) -> str | None:
+        if "codex_sandbox_mode" in self.profile:
+            raise BridgeError(
+                "Profile key codex_sandbox_mode is no longer supported. Use codex_permissions."
+            )
+
+        raw = self.profile.get("codex_permissions")
         if raw is None:
             return None
 
@@ -381,10 +397,43 @@ class Bridge:
         allowed = {"read-only", "workspace-write", "danger-full-access"}
         if value not in allowed:
             raise BridgeError(
-                "Unsupported codex_sandbox_mode/codex_permissions. "
+                "Unsupported codex_permissions. "
                 "Use read-only|workspace-write|danger-full-access (full-access alias supported)."
             )
         return value
+
+    def _resolve_codex_approval_policy(self) -> str | None:
+        raw = self.profile.get("codex_approval_policy")
+        if raw is None:
+            # Bridge is non-interactive by design; for full access keep command execution unblocked.
+            if self.codex_permissions_mode == "danger-full-access":
+                return "never"
+            return None
+
+        value = str(raw).strip().lower()
+        if not value:
+            return None
+        if value not in ALLOWED_APPROVAL_POLICIES:
+            raise BridgeError(
+                "Unsupported codex_approval_policy. "
+                "Use untrusted|on-failure|on-request|never."
+            )
+        return value
+
+    def _resolve_codex_web_search(self) -> bool:
+        raw = self.profile.get("codex_web_search")
+        if raw is None:
+            # Full-access profiles usually expect internet access for web tool usage.
+            return self.codex_permissions_mode == "danger-full-access"
+
+        if isinstance(raw, bool):
+            return raw
+        value = str(raw).strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off", ""}:
+            return False
+        raise BridgeError("Unsupported codex_web_search. Use boolean true|false.")
 
     @staticmethod
     def _has_sandbox_arg(args: list[str]) -> bool:
@@ -392,6 +441,17 @@ class Bridge:
             if arg in {"-s", "--sandbox"} or arg.startswith("--sandbox="):
                 return True
         return False
+
+    @staticmethod
+    def _has_approval_arg(args: list[str]) -> bool:
+        for arg in args:
+            if arg in {"-a", "--ask-for-approval"} or arg.startswith("--ask-for-approval="):
+                return True
+        return False
+
+    @staticmethod
+    def _has_search_arg(args: list[str]) -> bool:
+        return any(arg == "--search" for arg in args)
 
     # -------------------------
     # File/profile/state helpers
@@ -818,6 +878,7 @@ class Bridge:
             self.codex_bin,
             *self.codex_global_args,
             "exec",
+            *self.codex_exec_prefix_args,
             "--color",
             self.codex_color_mode,
             "resume",
@@ -867,6 +928,7 @@ class Bridge:
             self.codex_bin,
             *self.codex_global_args,
             "exec",
+            *self.codex_exec_prefix_args,
             "--color",
             self.codex_color_mode,
             "-o",
@@ -1081,6 +1143,9 @@ class Bridge:
         self._log(f"project={self.project_path}")
         self._log(f"thread={self.thread_id or '(not started)'}")
         self._log(f"thread_title={self.thread_title or '(disabled)'}")
+        self._log(f"codex_permissions={self.codex_permissions_mode or '(default)'}")
+        self._log(f"codex_approval_policy={self.codex_approval_policy or '(default)'}")
+        self._log("codex_web_search=" + ("enabled" if self.codex_web_search else "disabled"))
         if self.no_telegram:
             self._log("telegram=disabled (--no-telegram)")
         else:
@@ -1120,6 +1185,9 @@ class Bridge:
         self._acquire_lock()
         try:
             self._log(f"run-once profile={self.profile_id}")
+            self._log(f"codex_permissions={self.codex_permissions_mode or '(default)'}")
+            self._log(f"codex_approval_policy={self.codex_approval_policy or '(default)'}")
+            self._log("codex_web_search=" + ("enabled" if self.codex_web_search else "disabled"))
             rc, _ = self._run_codex_task(prompt)
             return rc
         finally:

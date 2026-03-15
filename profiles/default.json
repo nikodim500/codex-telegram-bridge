@@ -1,9 +1,10 @@
-{
+﻿{
   "profile_id": "default",
   "project_path": ".",
   "telegram_bot_token_env": "TELEGRAM_BOT_TOKEN",
   "allowed_chat_ids": [],
   "codex_bin": "codex",
+  "codex_permissions": "workspace-write",
   "codex_global_args": [],
   "codex_exec_args": [
     "--skip-git-repo-check"
