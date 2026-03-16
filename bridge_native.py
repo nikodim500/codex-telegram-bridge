@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -307,6 +308,10 @@ class Bridge:
         self._unauthorized_warned: set[int] = set()
         self._lock_fd: int | None = None
         self._telegram_token_lock_fd: int | None = None
+        self._proc_lock = threading.Lock()
+        self._active_proc: subprocess.Popen[bytes] | None = None
+        self._interrupt_requested = False
+        self._interrupt_reason = ""
 
         if not self.project_path.exists():
             raise BridgeError(f"project_path does not exist: {self.project_path}")
@@ -753,16 +758,90 @@ class Bridge:
             f"Queue size: {qsize}"
         )
 
+    def _permissions_text(self) -> str:
+        sandbox = self.codex_permissions_mode or "(codex default)"
+        approval = self.codex_approval_policy or "(codex default)"
+        web_search = "enabled" if self.codex_web_search else "disabled"
+        return (
+            "Codex permissions:\n"
+            f"Sandbox: {sandbox}\n"
+            f"Approval policy: {approval}\n"
+            f"Web search: {web_search}"
+        )
+
+    def _interrupt_active_execution(self, *, source: str) -> str:
+        with self._proc_lock:
+            proc = self._active_proc
+            if proc is None or proc.poll() is not None:
+                return "No active Codex execution to interrupt."
+            self._interrupt_requested = True
+            self._interrupt_reason = source
+
+        errors: list[str] = []
+        signaled = False
+
+        if os.name == "nt":
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            if ctrl_break is not None:
+                try:
+                    proc.send_signal(ctrl_break)
+                    signaled = True
+                except Exception as exc:
+                    errors.append(f"CTRL_BREAK failed: {exc}")
+
+        if not signaled:
+            try:
+                proc.terminate()
+                signaled = True
+            except Exception as exc:
+                errors.append(f"terminate failed: {exc}")
+
+        deadline = time.time() + 1.5
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                signaled = True
+            except Exception as exc:
+                errors.append(f"kill failed: {exc}")
+
+        if signaled:
+            return "Interrupt signal sent to active Codex execution."
+        details = "; ".join(errors) if errors else "unknown error"
+        return f"Failed to interrupt execution: {details}"
+
     def _help_text(self) -> str:
         return (
             "Commands:\n"
             "/help - show this help\n"
             "/status - current status\n"
+            "/permissions - current Codex permission settings\n"
+            "/esc - interrupt active Codex execution\n"
             "/thread - show current thread id\n"
             "/newsession - reset thread (next task starts a new thread)\n"
             "/queue - queue size\n"
             "/ping - health check"
         )
+
+    def _sync_telegram_commands(self) -> None:
+        if self.no_telegram:
+            return
+        commands = [
+            {"command": "status", "description": "Bridge status and queue size"},
+            {"command": "permissions", "description": "Current Codex permissions"},
+            {"command": "esc", "description": "Interrupt active execution"},
+            {"command": "thread", "description": "Show current thread id"},
+            {"command": "newsession", "description": "Reset thread for next task"},
+            {"command": "queue", "description": "Show queue size"},
+            {"command": "ping", "description": "Health check"},
+            {"command": "help", "description": "Show available commands"},
+        ]
+        try:
+            self._tg_call("setMyCommands", {"commands": commands}, timeout=20)
+        except Exception as exc:
+            self._log(f"setMyCommands failed: {exc}")
 
     # -------------------------
     # Message intake
@@ -779,6 +858,12 @@ class Bridge:
             return
         if cmd == "/status":
             self._send_telegram(chat_id, self._status_text())
+            return
+        if cmd == "/permissions":
+            self._send_telegram(chat_id, self._permissions_text())
+            return
+        if cmd == "/esc":
+            self._send_telegram(chat_id, self._interrupt_active_execution(source="telegram:/esc"))
             return
         if cmd == "/thread":
             self._send_telegram(chat_id, self.thread_id or "(not started)")
@@ -807,6 +892,12 @@ class Bridge:
             return True
         if cmd in {"/status", "status"}:
             self._log(self._status_text().replace("\n", " | "))
+            return True
+        if cmd in {"/permissions", "permissions"}:
+            self._log(self._permissions_text().replace("\n", " | "))
+            return True
+        if cmd in {"/esc", "esc"}:
+            self._log(self._interrupt_active_execution(source="local:/esc"))
             return True
         if cmd in {"/thread", "thread"}:
             self._log(f"thread={self.thread_id or '(not started)'}")
@@ -1013,6 +1104,10 @@ class Bridge:
 
         self._log_verbose(f"Running codex (thread={self.thread_id or 'new'})")
 
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1021,11 +1116,18 @@ class Bridge:
             cwd=str(self.project_path),
             text=False,
             bufsize=0,
+            creationflags=creationflags,
         )
+        with self._proc_lock:
+            self._active_proc = proc
+            self._interrupt_requested = False
+            self._interrupt_reason = ""
 
         observed_thread_id: str | None = None
         stream_section = ""
         stop_after_exec = False
+        interrupted = False
+        interrupt_reason = ""
 
         assert proc.stdout is not None
         try:
@@ -1093,6 +1195,12 @@ class Bridge:
                         progress_callback(cleaned)
         finally:
             rc = proc.wait()
+            with self._proc_lock:
+                interrupted = self._interrupt_requested
+                interrupt_reason = self._interrupt_reason
+                self._active_proc = None
+                self._interrupt_requested = False
+                self._interrupt_reason = ""
 
         if observed_thread_id and observed_thread_id != self.thread_id:
             self.thread_id = observed_thread_id
@@ -1107,7 +1215,10 @@ class Bridge:
             except Exception:
                 final_text = ""
 
-        if not final_text:
+        if interrupted:
+            suffix = f" ({interrupt_reason})" if interrupt_reason else ""
+            final_text = f"Execution interrupted by /esc{suffix}."
+        elif not final_text:
             final_text = f"(No final agent message captured. exit_code={rc})"
 
         try:
@@ -1202,6 +1313,7 @@ class Bridge:
                 "telegram_intermediate_updates="
                 + ("enabled" if self.telegram_intermediate_updates else "disabled (final-only)")
             )
+            self._sync_telegram_commands()
             self._send_startup_telegram_message()
 
         tg_thread: threading.Thread | None = None

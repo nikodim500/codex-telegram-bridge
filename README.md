@@ -55,6 +55,18 @@ Then run:
 python bridge_native.py --profile default
 ```
 
+Bot command menu is registered automatically (`setMyCommands`) on startup.
+Available Telegram/local slash commands:
+
+- `/help` - show available commands.
+- `/status` - bridge runtime status (thread, busy/idle, queue size).
+- `/permissions` - effective Codex sandbox/approval/web-search settings (plural command name).
+- `/esc` - interrupt active Codex execution (escape-like cancel for current run).
+- `/thread` - show current thread id.
+- `/newsession` - reset thread id; next task starts a new thread.
+- `/queue` - current queue size.
+- `/ping` - health check.
+
 ## Profiles
 
 Profile path format: `profiles/<name>.json`
