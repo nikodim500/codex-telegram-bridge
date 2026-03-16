@@ -261,7 +261,7 @@ class Bridge:
         self.startup_telegram_message_enabled = bool(self.profile.get("startup_telegram_message_enabled", False))
         self.startup_telegram_message_text = str(
             self.profile.get("startup_telegram_message_text")
-            or "Бридж запущен.\nПрофиль: {profile_id}\nТред: {thread_id}"
+            or "Bridge started.\nProfile: {profile_id}\nThread: {thread_id}"
         )
         self.thread_title = " ".join(str(self.profile.get("thread_title") or "").split())
         self.telegram_force_summary = bool(self.profile.get("telegram_force_summary", True))
@@ -643,11 +643,11 @@ class Bridge:
             return self.startup_telegram_message_text.format(**data)
         except Exception:
             return (
-                "Бридж запущен.\n"
-                f"Профиль: {data['profile_id']}\n"
-                f"Тред: {data['thread_id']}\n"
-                f"Название треда: {data['thread_title']}\n"
-                f"Время: {data['started_at']}"
+                "Bridge started.\n"
+                f"Profile: {data['profile_id']}\n"
+                f"Thread: {data['thread_id']}\n"
+                f"Thread title: {data['thread_title']}\n"
+                f"Time: {data['started_at']}"
             )
 
     def _send_startup_telegram_message(self) -> None:
@@ -676,10 +676,10 @@ class Bridge:
             return
 
         message = (
-            "Бридж остановлен.\n"
-            f"Профиль: {self.profile_id}\n"
-            f"Тред: {self.thread_id or '(not started)'}\n"
-            f"Время: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            "Bridge stopped.\n"
+            f"Profile: {self.profile_id}\n"
+            f"Thread: {self.thread_id or '(not started)'}\n"
+            f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
         )
         for chat_id in targets:
             try:
