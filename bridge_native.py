@@ -10,6 +10,7 @@ Goals for this variant:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -288,6 +289,10 @@ class Bridge:
         self.state_file = self.state_dir / f"{self.profile_id}.state.json"
         self.lock_file = self.state_dir / f"{self.profile_id}.lock"
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.telegram_token_lock_file: Path | None = None
+        if not self.no_telegram and self.telegram_token:
+            token_hash = hashlib.sha256(self.telegram_token.encode("utf-8")).hexdigest()[:16]
+            self.telegram_token_lock_file = self.state_dir / f"telegram-token-{token_hash}.lock"
 
         self.thread_id: str | None = None
         self.thread_title_applied_for: str | None = None
@@ -301,6 +306,7 @@ class Bridge:
         self._current_task: Task | None = None
         self._unauthorized_warned: set[int] = set()
         self._lock_fd: int | None = None
+        self._telegram_token_lock_fd: int | None = None
 
         if not self.project_path.exists():
             raise BridgeError(f"project_path does not exist: {self.project_path}")
@@ -509,8 +515,28 @@ class Bridge:
         os.write(fd, f"{os.getpid()}".encode("utf-8"))
         self._lock_fd = fd
 
+        if self.no_telegram or not self.telegram_token_lock_file:
+            return
+
+        try:
+            tg_fd = os.open(str(self.telegram_token_lock_file), flags)
+        except FileExistsError as exc:
+            self._release_lock()
+            raise BridgeError(
+                f"Telegram token lock exists: {self.telegram_token_lock_file}\n"
+                "Another bridge process is already running with this Telegram bot token."
+            ) from exc
+
+        os.write(tg_fd, f"{os.getpid()}".encode("utf-8"))
+        self._telegram_token_lock_fd = tg_fd
+
     def _release_lock(self) -> None:
         try:
+            if self._telegram_token_lock_fd is not None:
+                os.close(self._telegram_token_lock_fd)
+                self._telegram_token_lock_fd = None
+            if self.telegram_token_lock_file and self.telegram_token_lock_file.exists():
+                self.telegram_token_lock_file.unlink()
             if self._lock_fd is not None:
                 os.close(self._lock_fd)
                 self._lock_fd = None
@@ -639,6 +665,27 @@ class Bridge:
                 self._send_telegram(chat_id, message)
             except Exception as exc:
                 self._log(f"startup_telegram_message failed for chat_id={chat_id}: {exc}")
+
+    def _send_shutdown_telegram_message(self) -> None:
+        if self.no_telegram:
+            return
+
+        targets = sorted(self.allowed_chat_ids)
+        if not targets:
+            self._log("shutdown_telegram_message skipped: allowed_chat_ids is empty")
+            return
+
+        message = (
+            "Бридж остановлен.\n"
+            f"Профиль: {self.profile_id}\n"
+            f"Тред: {self.thread_id or '(not started)'}\n"
+            f"Время: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        for chat_id in targets:
+            try:
+                self._send_telegram(chat_id, message)
+            except Exception as exc:
+                self._log(f"shutdown_telegram_message failed for chat_id={chat_id}: {exc}")
 
     def _send_telegram_final(self, chat_id: int, rc: int, final_text: str) -> None:
         prefix = "Done." if rc == 0 else f"Done with issues (rc={rc})."
@@ -1172,6 +1219,7 @@ class Bridge:
             return 0
         finally:
             self._running = False
+            self._send_shutdown_telegram_message()
             self._save_state()
             self._release_lock()
             self._log("Bridge stopped.")
