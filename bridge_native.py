@@ -16,7 +16,6 @@ import json
 import os
 import queue
 import re
-import signal
 import shutil
 import subprocess
 import sys
@@ -312,6 +311,7 @@ class Bridge:
         self._active_proc: subprocess.Popen[bytes] | None = None
         self._interrupt_requested = False
         self._interrupt_reason = ""
+        self._telegram_commands_mode: str | None = None
 
         if not self.project_path.exists():
             raise BridgeError(f"project_path does not exist: {self.project_path}")
@@ -780,21 +780,14 @@ class Bridge:
         errors: list[str] = []
         signaled = False
 
-        if os.name == "nt":
-            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
-            if ctrl_break is not None:
-                try:
-                    proc.send_signal(ctrl_break)
-                    signaled = True
-                except Exception as exc:
-                    errors.append(f"CTRL_BREAK failed: {exc}")
-
-        if not signaled:
-            try:
-                proc.terminate()
-                signaled = True
-            except Exception as exc:
-                errors.append(f"terminate failed: {exc}")
+        # On Windows, CTRL_BREAK can propagate to the bridge console session and
+        # terminate the bridge itself. Use terminate/kill to scope interruption to
+        # the active Codex child process only.
+        try:
+            proc.terminate()
+            signaled = True
+        except Exception as exc:
+            errors.append(f"terminate failed: {exc}")
 
         deadline = time.time() + 1.5
         while proc.poll() is None and time.time() < deadline:
@@ -812,36 +805,76 @@ class Bridge:
         details = "; ".join(errors) if errors else "unknown error"
         return f"Failed to interrupt execution: {details}"
 
+    def _is_execution_active(self) -> bool:
+        with self._proc_lock:
+            proc = self._active_proc
+            return bool(proc is not None and proc.poll() is None)
+
+    def _telegram_commands_for_mode(self) -> tuple[str, list[dict[str, str]]]:
+        if self._is_execution_active():
+            return (
+                "exec",
+                [
+                    {"command": "esc", "description": "Interrupt active execution"},
+                ],
+            )
+        return (
+            "idle",
+            [
+                {"command": "status", "description": "Bridge status and queue size"},
+                {"command": "permissions", "description": "Current Codex permissions"},
+                {"command": "thread", "description": "Show current thread id"},
+                {"command": "newsession", "description": "Reset thread for next task"},
+                {"command": "queue", "description": "Show queue size"},
+                {"command": "ping", "description": "Health check"},
+                {"command": "help", "description": "Show available commands"},
+            ],
+        )
+
     def _help_text(self) -> str:
+        if self._is_execution_active():
+            return (
+                "Commands while Codex is running:\n"
+                "/esc - interrupt active Codex execution"
+            )
+
         return (
             "Commands:\n"
             "/help - show this help\n"
             "/status - current status\n"
             "/permissions - current Codex permission settings\n"
-            "/esc - interrupt active Codex execution\n"
             "/thread - show current thread id\n"
             "/newsession - reset thread (next task starts a new thread)\n"
             "/queue - queue size\n"
-            "/ping - health check"
+            "/ping - health check\n"
+            "/esc - available only while Codex is running"
         )
 
-    def _sync_telegram_commands(self) -> None:
+    def _sync_telegram_commands(self, *, force: bool = False) -> None:
         if self.no_telegram:
             return
-        commands = [
-            {"command": "status", "description": "Bridge status and queue size"},
-            {"command": "permissions", "description": "Current Codex permissions"},
-            {"command": "esc", "description": "Interrupt active execution"},
-            {"command": "thread", "description": "Show current thread id"},
-            {"command": "newsession", "description": "Reset thread for next task"},
-            {"command": "queue", "description": "Show queue size"},
-            {"command": "ping", "description": "Health check"},
-            {"command": "help", "description": "Show available commands"},
-        ]
+        mode, commands = self._telegram_commands_for_mode()
+        if not force and mode == self._telegram_commands_mode:
+            return
         try:
             self._tg_call("setMyCommands", {"commands": commands}, timeout=20)
+            self._telegram_commands_mode = mode
         except Exception as exc:
             self._log(f"setMyCommands failed: {exc}")
+
+    def _clear_telegram_commands(self) -> None:
+        if self.no_telegram:
+            return
+        try:
+            self._tg_call("deleteMyCommands", {}, timeout=20)
+            self._telegram_commands_mode = None
+        except Exception as exc:
+            self._log(f"deleteMyCommands failed: {exc}")
+            try:
+                self._tg_call("setMyCommands", {"commands": []}, timeout=20)
+                self._telegram_commands_mode = None
+            except Exception as nested_exc:
+                self._log(f"setMyCommands([]) failed: {nested_exc}")
 
     # -------------------------
     # Message intake
@@ -853,6 +886,19 @@ class Bridge:
 
     def _handle_telegram_command(self, chat_id: int, text: str) -> None:
         cmd = text.strip().split()[0].lower()
+        execution_active = self._is_execution_active()
+
+        if execution_active:
+            if cmd == "/esc":
+                self._send_telegram(chat_id, self._interrupt_active_execution(source="telegram:/esc"))
+                return
+            self._send_telegram(chat_id, "Codex is running. Only /esc is available right now.")
+            return
+
+        if cmd == "/esc":
+            self._send_telegram(chat_id, "/esc is available only while Codex is running.")
+            return
+
         if cmd == "/help":
             self._send_telegram(chat_id, self._help_text())
             return
@@ -861,9 +907,6 @@ class Bridge:
             return
         if cmd == "/permissions":
             self._send_telegram(chat_id, self._permissions_text())
-            return
-        if cmd == "/esc":
-            self._send_telegram(chat_id, self._interrupt_active_execution(source="telegram:/esc"))
             return
         if cmd == "/thread":
             self._send_telegram(chat_id, self.thread_id or "(not started)")
@@ -1122,6 +1165,7 @@ class Bridge:
             self._active_proc = proc
             self._interrupt_requested = False
             self._interrupt_reason = ""
+        self._sync_telegram_commands()
 
         observed_thread_id: str | None = None
         stream_section = ""
@@ -1201,6 +1245,7 @@ class Bridge:
                 self._active_proc = None
                 self._interrupt_requested = False
                 self._interrupt_reason = ""
+            self._sync_telegram_commands()
 
         if observed_thread_id and observed_thread_id != self.thread_id:
             self.thread_id = observed_thread_id
@@ -1313,7 +1358,10 @@ class Bridge:
                 "telegram_intermediate_updates="
                 + ("enabled" if self.telegram_intermediate_updates else "disabled (final-only)")
             )
-            self._sync_telegram_commands()
+            # Hard resync on startup: if previous run died ungracefully, clear stale
+            # command menu first and then publish current idle commands.
+            self._clear_telegram_commands()
+            self._sync_telegram_commands(force=True)
             self._send_startup_telegram_message()
 
         tg_thread: threading.Thread | None = None
@@ -1331,6 +1379,7 @@ class Bridge:
             return 0
         finally:
             self._running = False
+            self._clear_telegram_commands()
             self._send_shutdown_telegram_message()
             self._save_state()
             self._release_lock()
