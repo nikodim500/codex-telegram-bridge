@@ -56,16 +56,23 @@ python bridge_native.py --profile default
 ```
 
 Bot command menu is registered automatically (`setMyCommands`) on startup.
+In `telegram_format_mode: "html"`, bridge service messages (status/help/permissions/etc.) are sent in monospace (`<pre>`).
 Available Telegram/local slash commands:
 
 - `/help` - show available commands.
-- `/status` - bridge runtime status (thread, busy/idle, queue size).
+- `/status` - bridge runtime status (thread, busy/idle, queue size) + fresh Codex limits usage (via short probe run).
 - `/permissions` - effective Codex sandbox/approval/web-search settings (plural command name).
-- `/esc` - interrupt active Codex execution (escape-like cancel for current run).
+- `/esc` - interrupt active Codex execution (available only during active run).
 - `/thread` - show current thread id.
 - `/newsession` - reset thread id; next task starts a new thread.
 - `/queue` - current queue size.
 - `/ping` - health check.
+
+Telegram command menu follows execution state:
+
+- While Codex is running: bridge tries to expose only `/esc`.
+- While Codex is idle: regular command set is exposed (without `/esc`).
+- On graceful bridge shutdown: command menu is cleared so it is obvious the bridge is stopped.
 
 ## Profiles
 

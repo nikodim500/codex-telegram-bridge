@@ -10,6 +10,8 @@ Goals for this variant:
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from datetime import datetime
 import hashlib
 import html
 import json
@@ -30,6 +32,9 @@ from urllib import request as urlrequest
 MAX_TELEGRAM_TEXT = 3900
 SESSION_ID_RE = re.compile(r"session id:\s*([0-9a-fA-F-]{36})", re.IGNORECASE)
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+CONTEXT_LIMIT_RE = re.compile(r"^context window:\s*(.+)$", re.IGNORECASE)
+FIVE_HOUR_LIMIT_RE = re.compile(r"^5h limit:\s*(.+)$", re.IGNORECASE)
+WEEKLY_LIMIT_RE = re.compile(r"^weekly limit:\s*(.+)$", re.IGNORECASE)
 DEFAULT_TG_SUMMARY_MAX_CHARS = 1400
 DEFAULT_TG_SUMMARY_MAX_LINES = 24
 DEFAULT_TG_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
@@ -289,6 +294,8 @@ class Bridge:
         self.state_file = self.state_dir / f"{self.profile_id}.state.json"
         self.lock_file = self.state_dir / f"{self.profile_id}.lock"
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        codex_home = Path(os.path.expanduser(os.path.expandvars(os.getenv("CODEX_HOME") or "~/.codex")))
+        self.codex_sessions_dir = codex_home / "sessions"
         self.telegram_token_lock_file: Path | None = None
         if not self.no_telegram and self.telegram_token:
             token_hash = hashlib.sha256(self.telegram_token.encode("utf-8")).hexdigest()[:16]
@@ -311,6 +318,10 @@ class Bridge:
         self._active_proc: subprocess.Popen[bytes] | None = None
         self._interrupt_requested = False
         self._interrupt_reason = ""
+        self._limits_refresh_lock = threading.Lock()
+        self._limit_context_window = ""
+        self._limit_5h = ""
+        self._limit_weekly = ""
         self._telegram_commands_mode: str | None = None
 
         if not self.project_path.exists():
@@ -636,6 +647,24 @@ class Bridge:
         for chunk in split_telegram_text(payload):
             self._send_telegram_raw(chat_id, chunk)
 
+    def _send_telegram_system(self, chat_id: int, text: str, *, with_thread_prefix: bool = True) -> None:
+        """Send bridge/system info in monospace when HTML mode is enabled."""
+        if self.no_telegram:
+            return
+        payload = self._telegram_text_with_prefix(text) if with_thread_prefix else text
+        if self.telegram_format_mode != "html":
+            self._send_telegram(chat_id, text, with_thread_prefix=with_thread_prefix)
+            return
+        html_payload = f"<pre>{html.escape(payload)}</pre>"
+        if len(html_payload) > MAX_TELEGRAM_TEXT:
+            # Keep delivery robust for larger status/help payloads.
+            self._send_telegram(chat_id, payload, with_thread_prefix=False)
+            return
+        try:
+            self._send_telegram_raw(chat_id, html_payload, parse_mode="HTML")
+        except Exception:
+            self._send_telegram(chat_id, payload, with_thread_prefix=False)
+
     def _build_startup_message(self) -> str:
         data = {
             "profile_id": self.profile_id,
@@ -667,7 +696,7 @@ class Bridge:
         message = self._build_startup_message()
         for chat_id in targets:
             try:
-                self._send_telegram(chat_id, message)
+                self._send_telegram_system(chat_id, message)
             except Exception as exc:
                 self._log(f"startup_telegram_message failed for chat_id={chat_id}: {exc}")
 
@@ -688,12 +717,22 @@ class Bridge:
         )
         for chat_id in targets:
             try:
-                self._send_telegram(chat_id, message)
+                self._send_telegram_system(chat_id, message)
             except Exception as exc:
                 self._log(f"shutdown_telegram_message failed for chat_id={chat_id}: {exc}")
 
-    def _send_telegram_final(self, chat_id: int, rc: int, final_text: str) -> None:
-        prefix = "Done." if rc == 0 else f"Done with issues (rc={rc})."
+    def _send_telegram_final(
+        self,
+        chat_id: int,
+        rc: int,
+        final_text: str,
+        *,
+        interrupted: bool = False,
+    ) -> None:
+        if interrupted:
+            prefix = "Interrupted."
+        else:
+            prefix = "Done." if rc == 0 else f"Done with issues (rc={rc})."
         body, _ = compact_for_telegram(
             final_text,
             max_chars=self.telegram_summary_max_chars,
@@ -748,6 +787,10 @@ class Bridge:
         qsize = self._queue.qsize()
         status = "busy" if self._busy else "idle"
         current = self._current_task.source if self._current_task else "-"
+        with self._proc_lock:
+            limit_context = self._limit_context_window or "(unknown)"
+            limit_5h = self._limit_5h or "(unknown)"
+            limit_weekly = self._limit_weekly or "(unknown)"
         return (
             f"Profile: {self.profile_id}\n"
             f"Project: {self.project_path}\n"
@@ -755,7 +798,11 @@ class Bridge:
             f"Thread title: {self.thread_title or '-'}\n"
             f"Status: {status}\n"
             f"Current task source: {current}\n"
-            f"Queue size: {qsize}"
+            f"Queue size: {qsize}\n"
+            "Codex limits usage:\n"
+            f"- Context window: {limit_context}\n"
+            f"- 5h limit: {limit_5h}\n"
+            f"- Weekly limit: {limit_weekly}"
         )
 
     def _permissions_text(self) -> str:
@@ -780,14 +827,30 @@ class Bridge:
         errors: list[str] = []
         signaled = False
 
-        # On Windows, CTRL_BREAK can propagate to the bridge console session and
-        # terminate the bridge itself. Use terminate/kill to scope interruption to
-        # the active Codex child process only.
-        try:
-            proc.terminate()
-            signaled = True
-        except Exception as exc:
-            errors.append(f"terminate failed: {exc}")
+        if os.name == "nt":
+            # Codex may spawn child processes on Windows. Kill the full process tree
+            # so /esc reliably stops long-running tool calls.
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=5,
+                )
+                if completed.returncode == 0 or proc.poll() is not None:
+                    signaled = True
+                else:
+                    out = (completed.stdout or "").strip()
+                    errors.append(f"taskkill rc={completed.returncode}: {out or 'no output'}")
+            except Exception as exc:
+                errors.append(f"taskkill failed: {exc}")
+        else:
+            try:
+                proc.terminate()
+                signaled = True
+            except Exception as exc:
+                errors.append(f"terminate failed: {exc}")
 
         deadline = time.time() + 1.5
         while proc.poll() is None and time.time() < deadline:
@@ -850,31 +913,73 @@ class Bridge:
             "/esc - available only while Codex is running"
         )
 
-    def _sync_telegram_commands(self, *, force: bool = False) -> None:
+    def _sync_telegram_commands(self, *, force: bool = False) -> bool:
         if self.no_telegram:
-            return
+            return True
         mode, commands = self._telegram_commands_for_mode()
         if not force and mode == self._telegram_commands_mode:
-            return
-        try:
-            self._tg_call("setMyCommands", {"commands": commands}, timeout=20)
+            return True
+        scopes = self._telegram_command_apply_scopes()
+        all_ok = True
+        for scope_payload in scopes:
+            payload = {"commands": commands, **scope_payload}
+            last_exc: Exception | None = None
+            ok = False
+            for attempt in range(2):
+                try:
+                    self._tg_call("setMyCommands", payload, timeout=20)
+                    ok = True
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    self._log(f"setMyCommands failed (attempt {attempt + 1}/2): {exc}")
+                    if attempt == 0:
+                        time.sleep(0.3)
+            if not ok:
+                all_ok = False
+                if last_exc is not None:
+                    self._log(f"setMyCommands not applied for scope={scope_payload!r}: {last_exc}")
+        if all_ok:
             self._telegram_commands_mode = mode
-        except Exception as exc:
-            self._log(f"setMyCommands failed: {exc}")
+            return True
+        self._telegram_commands_mode = None
+        return False
+
+    def _telegram_command_apply_scopes(self) -> list[dict[str, Any]]:
+        # In restricted mode, bind commands to explicit chat scopes so Telegram
+        # clients don't keep showing stale commands from a different scope.
+        if self.allowed_chat_ids:
+            scopes: list[dict[str, Any]] = []
+            for chat_id in sorted(self.allowed_chat_ids):
+                scopes.append({"scope": {"type": "chat", "chat_id": chat_id}})
+            return scopes
+        return [{}]
+
+    def _telegram_command_clear_scopes(self) -> list[dict[str, Any]]:
+        # Clear active scopes plus default legacy scope left by older builds.
+        scopes = self._telegram_command_apply_scopes()
+        has_default = any(
+            isinstance(x.get("scope"), dict) and x.get("scope", {}).get("type") == "default"
+            for x in scopes
+            if isinstance(x, dict)
+        )
+        if not has_default:
+            scopes = [*scopes, {"scope": {"type": "default"}}]
+        return scopes
 
     def _clear_telegram_commands(self) -> None:
         if self.no_telegram:
             return
-        try:
-            self._tg_call("deleteMyCommands", {}, timeout=20)
-            self._telegram_commands_mode = None
-        except Exception as exc:
-            self._log(f"deleteMyCommands failed: {exc}")
+        for scope_payload in self._telegram_command_clear_scopes():
             try:
-                self._tg_call("setMyCommands", {"commands": []}, timeout=20)
-                self._telegram_commands_mode = None
-            except Exception as nested_exc:
-                self._log(f"setMyCommands([]) failed: {nested_exc}")
+                self._tg_call("deleteMyCommands", scope_payload, timeout=20)
+            except Exception as exc:
+                self._log(f"deleteMyCommands failed for scope={scope_payload!r}: {exc}")
+                try:
+                    self._tg_call("setMyCommands", {"commands": [], **scope_payload}, timeout=20)
+                except Exception as nested_exc:
+                    self._log(f"setMyCommands([]) failed for scope={scope_payload!r}: {nested_exc}")
+        self._telegram_commands_mode = None
 
     # -------------------------
     # Message intake
@@ -890,42 +995,43 @@ class Bridge:
 
         if execution_active:
             if cmd == "/esc":
-                self._send_telegram(chat_id, self._interrupt_active_execution(source="telegram:/esc"))
+                self._send_telegram_system(chat_id, self._interrupt_active_execution(source="telegram:/esc"))
                 return
-            self._send_telegram(chat_id, "Codex is running. Only /esc is available right now.")
+            self._send_telegram_system(chat_id, "Codex is running. Only /esc is available right now.")
             return
 
         if cmd == "/esc":
-            self._send_telegram(chat_id, "/esc is available only while Codex is running.")
+            self._send_telegram_system(chat_id, "/esc is available only while Codex is running.")
             return
 
         if cmd == "/help":
-            self._send_telegram(chat_id, self._help_text())
+            self._send_telegram_system(chat_id, self._help_text())
             return
         if cmd == "/status":
-            self._send_telegram(chat_id, self._status_text())
+            self._refresh_limits_usage()
+            self._send_telegram_system(chat_id, self._status_text())
             return
         if cmd == "/permissions":
-            self._send_telegram(chat_id, self._permissions_text())
+            self._send_telegram_system(chat_id, self._permissions_text())
             return
         if cmd == "/thread":
-            self._send_telegram(chat_id, self.thread_id or "(not started)")
+            self._send_telegram_system(chat_id, self.thread_id or "(not started)")
             return
         if cmd == "/newsession":
             self.thread_id = None
             self.thread_title_applied_for = None
             self.thread_title_applied_value = None
             self._save_state()
-            self._send_telegram(chat_id, "Thread reset. Next task will start a new Codex thread.")
+            self._send_telegram_system(chat_id, "Thread reset. Next task will start a new Codex thread.")
             return
         if cmd == "/queue":
-            self._send_telegram(chat_id, f"Queue size: {self._queue.qsize()}")
+            self._send_telegram_system(chat_id, f"Queue size: {self._queue.qsize()}")
             return
         if cmd == "/ping":
-            self._send_telegram(chat_id, "pong")
+            self._send_telegram_system(chat_id, "pong")
             return
 
-        self._send_telegram(chat_id, "Unknown command. Use /help.")
+        self._send_telegram_system(chat_id, "Unknown command. Use /help.")
 
     def _handle_local_command(self, text: str) -> bool:
         cmd = text.strip().split()[0].lower()
@@ -934,6 +1040,7 @@ class Bridge:
             self._log("Local-only: /exit stops bridge.")
             return True
         if cmd in {"/status", "status"}:
+            self._refresh_limits_usage()
             self._log(self._status_text().replace("\n", " | "))
             return True
         if cmd in {"/permissions", "permissions"}:
@@ -1134,12 +1241,229 @@ class Bridge:
             prompt,
         ]
 
+    def _build_codex_limits_probe_cmd(self, *, last_message_file: Path) -> list[str]:
+        # Run a lightweight one-off probe to refresh displayed account limits.
+        probe_prompt = "Reply with exactly: LIMITS_PROBE_OK. Do not call any tools."
+        return [
+            self.codex_bin,
+            *self.codex_global_args,
+            "exec",
+            *self.codex_exec_prefix_args,
+            "--color",
+            self.codex_color_mode,
+            "-o",
+            str(last_message_file),
+            "-C",
+            str(self.project_path),
+            *self.codex_exec_args,
+            probe_prompt,
+        ]
+
+    def _refresh_limits_usage(self) -> None:
+        if self._is_execution_active():
+            return
+        if not self._limits_refresh_lock.acquire(blocking=False):
+            return
+        ts = int(time.time() * 1000)
+        last_msg_file = self.state_dir / f"_tmp_limits_probe_{self.profile_id}_{ts}.txt"
+        cmd = self._build_codex_limits_probe_cmd(last_message_file=last_msg_file)
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=str(self.project_path),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=45,
+                creationflags=creationflags,
+            )
+            out = proc.stdout or ""
+            matched = False
+            for line in out.splitlines():
+                plain_line = ANSI_ESCAPE_RE.sub("", line)
+                if self._capture_limits_usage_line(plain_line):
+                    matched = True
+            if not matched:
+                self._log("Limits refresh probe: no limits lines found in output.")
+        except subprocess.TimeoutExpired:
+            self._log("Limits refresh probe timed out.")
+        except Exception as exc:
+            self._log(f"Limits refresh probe failed: {exc}")
+        finally:
+            self._refresh_limits_usage_from_sessions()
+            try:
+                if last_msg_file.exists():
+                    last_msg_file.unlink()
+            except Exception:
+                pass
+            self._limits_refresh_lock.release()
+
+    def _refresh_limits_usage_from_sessions(self) -> None:
+        context_line = ""
+        five_line = ""
+        weekly_line = ""
+
+        payload = self._load_latest_token_count_for_thread()
+        if payload:
+            info = payload.get("info") if isinstance(payload, dict) else None
+            if isinstance(info, dict):
+                context_line = self._format_context_limits_line(info)
+
+        rate_limits = None
+        if isinstance(payload, dict):
+            rate_limits = payload.get("rate_limits")
+        if not isinstance(rate_limits, dict):
+            rate_limits = self._load_latest_global_rate_limits()
+
+        if isinstance(rate_limits, dict):
+            primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else None
+            secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else None
+            if isinstance(primary, dict):
+                five_line = self._format_window_limit_line(primary)
+            if isinstance(secondary, dict):
+                weekly_line = self._format_window_limit_line(secondary)
+
+        with self._proc_lock:
+            if context_line:
+                self._limit_context_window = context_line
+            if five_line:
+                self._limit_5h = five_line
+            if weekly_line:
+                self._limit_weekly = weekly_line
+
+    def _load_latest_token_count_for_thread(self) -> dict[str, Any] | None:
+        if not self.thread_id or not self.codex_sessions_dir.exists():
+            return None
+        pattern = f"*{self.thread_id}*.jsonl"
+        candidates = sorted(
+            self.codex_sessions_dir.rglob(pattern),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for session_file in candidates:
+            payload = self._load_last_token_count_payload(session_file)
+            if payload is not None:
+                return payload
+        return None
+
+    def _load_latest_global_rate_limits(self) -> dict[str, Any] | None:
+        if not self.codex_sessions_dir.exists():
+            return None
+        candidates = sorted(
+            self.codex_sessions_dir.rglob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:40]
+        best_ts = ""
+        best_rate_limits: dict[str, Any] | None = None
+        for session_file in candidates:
+            try:
+                with session_file.open("r", encoding="utf-8", errors="replace") as fh:
+                    for raw in fh:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            event = json.loads(raw)
+                        except Exception:
+                            continue
+                        if event.get("type") != "event_msg":
+                            continue
+                        payload = event.get("payload")
+                        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                            continue
+                        rate_limits = payload.get("rate_limits")
+                        if not isinstance(rate_limits, dict):
+                            continue
+                        ts = str(event.get("timestamp") or "")
+                        if ts >= best_ts:
+                            best_ts = ts
+                            best_rate_limits = rate_limits
+            except Exception:
+                continue
+        return best_rate_limits
+
+    def _load_last_token_count_payload(self, session_file: Path) -> dict[str, Any] | None:
+        last_payload: dict[str, Any] | None = None
+        try:
+            with session_file.open("r", encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except Exception:
+                        continue
+                    if event.get("type") != "event_msg":
+                        continue
+                    payload = event.get("payload")
+                    if isinstance(payload, dict) and payload.get("type") == "token_count":
+                        last_payload = payload
+        except Exception:
+            return None
+        return last_payload
+
+    def _format_context_limits_line(self, info: dict[str, Any]) -> str:
+        model_context_window = info.get("model_context_window")
+        if not isinstance(model_context_window, int) or model_context_window <= 0:
+            return ""
+        used = None
+        last_usage = info.get("last_token_usage")
+        if isinstance(last_usage, dict):
+            used_val = last_usage.get("total_tokens")
+            if isinstance(used_val, int) and used_val >= 0:
+                used = used_val
+        if used is None:
+            total_usage = info.get("total_token_usage")
+            if isinstance(total_usage, dict):
+                used_val = total_usage.get("total_tokens")
+                if isinstance(used_val, int) and used_val >= 0:
+                    used = min(used_val, model_context_window)
+        if used is None:
+            return ""
+        ratio = min(max(used / float(model_context_window), 0.0), 1.0)
+        left_percent = int(round((1.0 - ratio) * 100))
+        return f"{left_percent}% left ({self._format_compact_number(used)} used / {self._format_compact_number(model_context_window)})"
+
+    def _format_window_limit_line(self, limit_window: dict[str, Any]) -> str:
+        used_percent = limit_window.get("used_percent")
+        resets_at = limit_window.get("resets_at")
+        if not isinstance(used_percent, (int, float)):
+            return ""
+        left_percent = int(round(max(0.0, min(100.0, 100.0 - float(used_percent)))))
+        filled = int(round((left_percent / 100.0) * 20))
+        filled = max(0, min(20, filled))
+        bar = "#" * filled + "-" * (20 - filled)
+        reset_text = "unknown"
+        if isinstance(resets_at, (int, float)) and resets_at > 0:
+            try:
+                reset_text = datetime.fromtimestamp(float(resets_at)).strftime("%H:%M on %d %b")
+            except Exception:
+                reset_text = "unknown"
+        return f"[{bar}] {left_percent}% left (resets {reset_text})"
+
+    def _format_compact_number(self, value: int) -> str:
+        if value >= 1_000_000:
+            millions = value / 1_000_000
+            return f"{millions:.1f}M".replace(".0M", "M")
+        if value >= 1_000:
+            thousands = int(round(value / 1_000))
+            return f"{thousands}K"
+        return str(value)
+
     def _run_codex_task(
         self,
         prompt: str,
         *,
         progress_callback: Callable[[str], None] | None = None,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, str, bool]:
         self._ensure_thread_title_applied()
         ts = int(time.time() * 1000)
         last_msg_file = self.state_dir / f"_tmp_last_msg_{self.profile_id}_{ts}.txt"
@@ -1172,6 +1496,7 @@ class Bridge:
         stop_after_exec = False
         interrupted = False
         interrupt_reason = ""
+        output_tail: deque[str] = deque(maxlen=20)
 
         assert proc.stdout is not None
         try:
@@ -1191,6 +1516,10 @@ class Bridge:
 
                 if line:
                     plain_line = ANSI_ESCAPE_RE.sub("", line)
+                    self._capture_limits_usage_line(plain_line)
+                    compact = plain_line.strip()
+                    if compact:
+                        output_tail.append(compact)
                     match = SESSION_ID_RE.search(plain_line)
                     if match:
                         observed_thread_id = match.group(1).lower()
@@ -1264,7 +1593,15 @@ class Bridge:
             suffix = f" ({interrupt_reason})" if interrupt_reason else ""
             final_text = f"Execution interrupted by /esc{suffix}."
         elif not final_text:
-            final_text = f"(No final agent message captured. exit_code={rc})"
+            if rc != 0 and output_tail:
+                tail = "\n".join(output_tail)
+                final_text = (
+                    f"(No final agent message captured. exit_code={rc})\n\n"
+                    "Last Codex output:\n"
+                    f"{tail}"
+                )
+            else:
+                final_text = f"(No final agent message captured. exit_code={rc})"
 
         try:
             if last_msg_file.exists():
@@ -1272,7 +1609,34 @@ class Bridge:
         except Exception:
             pass
 
-        return rc, final_text
+        return rc, final_text, interrupted
+
+    def _capture_limits_usage_line(self, raw_line: str) -> bool:
+        clean = raw_line.strip()
+        if not clean:
+            return False
+        clean = clean.strip("│").strip()
+        if not clean:
+            return False
+
+        context_match = CONTEXT_LIMIT_RE.match(clean)
+        if context_match:
+            with self._proc_lock:
+                self._limit_context_window = context_match.group(1).strip()
+            return True
+
+        five_match = FIVE_HOUR_LIMIT_RE.match(clean)
+        if five_match:
+            with self._proc_lock:
+                self._limit_5h = five_match.group(1).strip()
+            return True
+
+        weekly_match = WEEKLY_LIMIT_RE.match(clean)
+        if weekly_match:
+            with self._proc_lock:
+                self._limit_weekly = weekly_match.group(1).strip()
+            return True
+        return False
 
     # -------------------------
     # Worker loop
@@ -1290,6 +1654,7 @@ class Bridge:
 
             rc = 1
             final_text = ""
+            interrupted = False
             try:
                 progress_callback = None
                 if task.source == "telegram" and task.chat_id and self.telegram_intermediate_updates:
@@ -1312,7 +1677,10 @@ class Bridge:
 
                     progress_callback = _progress_callback
 
-                rc, final_text = self._run_codex_task(task.prompt, progress_callback=progress_callback)
+                rc, final_text, interrupted = self._run_codex_task(
+                    task.prompt,
+                    progress_callback=progress_callback,
+                )
             except Exception as exc:
                 final_text = f"Bridge execution error: {exc}"
                 self._log(final_text)
@@ -1321,16 +1689,22 @@ class Bridge:
             self._busy = False
             self._current_task = None
 
-            if rc != 0:
+            if interrupted:
+                self._log(f"Task interrupted in {elapsed}s")
+            elif rc != 0:
                 self._log(f"Task failed in {elapsed}s, rc={rc}")
             else:
                 self._log_verbose(f"Task done in {elapsed}s, rc={rc}")
 
             if task.source == "telegram" and task.chat_id:
                 try:
-                    self._send_telegram_final(task.chat_id, rc, final_text)
+                    self._send_telegram_final(task.chat_id, rc, final_text, interrupted=interrupted)
                 except Exception as exc:
                     self._log(f"Telegram send failed after run: {exc}")
+
+            # Self-heal menu state after each task (important after /esc and transient API failures).
+            self._telegram_commands_mode = None
+            self._sync_telegram_commands(force=True)
 
             self._queue.task_done()
             self._save_state()
@@ -1397,7 +1771,7 @@ class Bridge:
             self._log(f"codex_permissions={self.codex_permissions_mode or '(default)'}")
             self._log(f"codex_approval_policy={self.codex_approval_policy or '(default)'}")
             self._log("codex_web_search=" + ("enabled" if self.codex_web_search else "disabled"))
-            rc, _ = self._run_codex_task(prompt)
+            rc, _, _ = self._run_codex_task(prompt)
             return rc
         finally:
             self._save_state()
