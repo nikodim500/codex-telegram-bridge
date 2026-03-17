@@ -15,6 +15,7 @@ from datetime import datetime
 import hashlib
 import html
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -23,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib import error as urlerror
@@ -53,6 +54,7 @@ class Task:
     prompt: str
     chat_id: int | None = None
     message_id: int | None = None
+    image_paths: list[str] = field(default_factory=list)
     enqueued_at: float = 0.0
 
 
@@ -279,12 +281,15 @@ class Bridge:
         self.telegram_progress_min_interval_seconds = float(
             self.profile.get("telegram_progress_min_interval_seconds", DEFAULT_TG_PROGRESS_MIN_INTERVAL_SECONDS)
         )
+        self.telegram_max_file_bytes = int(self.profile.get("telegram_max_file_bytes", 25 * 1024 * 1024))
         if self.telegram_summary_max_chars < 300 or self.telegram_summary_max_chars > MAX_TELEGRAM_TEXT:
             raise BridgeError("telegram_summary_max_chars must be within 300..3900")
         if self.telegram_summary_max_lines < 3 or self.telegram_summary_max_lines > 80:
             raise BridgeError("telegram_summary_max_lines must be within 3..80")
         if self.telegram_progress_min_interval_seconds < 0.0 or self.telegram_progress_min_interval_seconds > 10.0:
             raise BridgeError("telegram_progress_min_interval_seconds must be within 0.0..10.0")
+        if self.telegram_max_file_bytes < 1024 or self.telegram_max_file_bytes > 200 * 1024 * 1024:
+            raise BridgeError("telegram_max_file_bytes must be within 1024..209715200")
 
         self.allowed_chat_ids = to_int_set(self.profile.get("allowed_chat_ids", []))
         self.telegram_token_env = str(self.profile.get("telegram_bot_token_env") or "TELEGRAM_BOT_TOKEN")
@@ -296,6 +301,12 @@ class Bridge:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         codex_home = Path(os.path.expanduser(os.path.expandvars(os.getenv("CODEX_HOME") or "~/.codex")))
         self.codex_sessions_dir = codex_home / "sessions"
+        uploads_raw = str(self.profile.get("telegram_uploads_dir") or ".bridge_uploads").strip()
+        uploads_path = Path(os.path.expanduser(os.path.expandvars(uploads_raw)))
+        if not uploads_path.is_absolute():
+            uploads_path = (self.project_path / uploads_path).resolve()
+        self.telegram_uploads_dir = uploads_path
+        self.telegram_uploads_dir.mkdir(parents=True, exist_ok=True)
         self.telegram_token_lock_file: Path | None = None
         if not self.no_telegram and self.telegram_token:
             token_hash = hashlib.sha256(self.telegram_token.encode("utf-8")).hexdigest()[:16]
@@ -664,6 +675,134 @@ class Bridge:
             self._send_telegram_raw(chat_id, html_payload, parse_mode="HTML")
         except Exception:
             self._send_telegram(chat_id, payload, with_thread_prefix=False)
+
+    def _sanitize_upload_name(self, value: str) -> str:
+        normalized = re.sub(r"[^\w.\-]+", "_", (value or "").strip(), flags=re.UNICODE)
+        normalized = normalized.strip("._-")
+        return normalized or "file"
+
+    def _tg_download_file(self, file_id: str) -> tuple[bytes, str]:
+        info = self._tg_call("getFile", {"file_id": file_id}, timeout=25)
+        if not isinstance(info, dict):
+            raise BridgeError("Telegram getFile returned invalid payload")
+        file_path = str(info.get("file_path") or "").strip()
+        if not file_path:
+            raise BridgeError("Telegram getFile returned empty file_path")
+        url = f"https://api.telegram.org/file/bot{self.telegram_token}/{file_path}"
+        req = urlrequest.Request(url, method="GET")
+        try:
+            with urlrequest.urlopen(req, timeout=35) as resp:
+                data = resp.read()
+        except Exception as exc:
+            raise BridgeError(f"Telegram file download failed: {exc}") from exc
+        return data, file_path
+
+    def _save_telegram_file(
+        self,
+        *,
+        file_id: str,
+        original_name: str | None,
+        mime_type: str | None,
+        chat_id: int,
+    ) -> dict[str, Any]:
+        data, remote_file_path = self._tg_download_file(file_id)
+        size = len(data)
+        if size > self.telegram_max_file_bytes:
+            raise BridgeError(
+                f"File is too large ({size} bytes). Limit: {self.telegram_max_file_bytes} bytes."
+            )
+
+        original = (original_name or "").strip()
+        suffix = Path(original).suffix if original else ""
+        if not suffix:
+            suffix = Path(remote_file_path).suffix
+        if not suffix and mime_type:
+            suffix = mimetypes.guess_extension(mime_type) or ""
+        if not suffix:
+            suffix = ".bin"
+
+        stem = Path(original).stem if original else f"tg_{file_id[:12]}"
+        stem = self._sanitize_upload_name(stem)
+        ts = int(time.time() * 1000)
+        fname = f"{ts}_{chat_id}_{stem}{suffix}"
+        out_path = self.telegram_uploads_dir / fname
+        out_path.write_bytes(data)
+
+        return {
+            "path": str(out_path),
+            "name": original or Path(remote_file_path).name or fname,
+            "mime": mime_type or "",
+            "size": size,
+            "is_image": bool((mime_type or "").lower().startswith("image/")),
+        }
+
+    def _extract_telegram_attachments(self, message: dict[str, Any], chat_id: int) -> tuple[list[dict[str, Any]], list[str]]:
+        files: list[dict[str, Any]] = []
+        warnings: list[str] = []
+
+        document = message.get("document")
+        if isinstance(document, dict):
+            file_id = str(document.get("file_id") or "").strip()
+            if file_id:
+                try:
+                    files.append(
+                        self._save_telegram_file(
+                            file_id=file_id,
+                            original_name=str(document.get("file_name") or "").strip() or None,
+                            mime_type=str(document.get("mime_type") or "").strip() or None,
+                            chat_id=chat_id,
+                        )
+                    )
+                except Exception as exc:
+                    warnings.append(f"document: {exc}")
+
+        photos = message.get("photo")
+        if isinstance(photos, list) and photos:
+            best_photo: dict[str, Any] | None = None
+            for item in photos:
+                if not isinstance(item, dict):
+                    continue
+                if best_photo is None:
+                    best_photo = item
+                    continue
+                best_size = int(best_photo.get("file_size") or 0)
+                item_size = int(item.get("file_size") or 0)
+                if item_size >= best_size:
+                    best_photo = item
+            if best_photo is not None:
+                file_id = str(best_photo.get("file_id") or "").strip()
+                if file_id:
+                    try:
+                        files.append(
+                            self._save_telegram_file(
+                                file_id=file_id,
+                                original_name=f"photo_{best_photo.get('file_unique_id') or file_id[:12]}.jpg",
+                                mime_type="image/jpeg",
+                                chat_id=chat_id,
+                            )
+                        )
+                    except Exception as exc:
+                        warnings.append(f"photo: {exc}")
+
+        return files, warnings
+
+    def _build_prompt_from_telegram_message(self, text: str, attachments: list[dict[str, Any]]) -> str:
+        clean = (text or "").strip()
+        if not attachments:
+            return clean
+
+        base_prompt = clean or "Process the uploaded file(s)."
+        lines = [
+            "Telegram attachments were downloaded to local files:",
+        ]
+        for item in attachments:
+            lines.append(
+                f"- {item['path']} (name: {item['name']}; mime: {item['mime'] or 'unknown'}; bytes: {item['size']})"
+            )
+        if any(bool(item.get("is_image")) for item in attachments):
+            lines.append("Image attachments are passed directly to Codex as image inputs.")
+        lines.append("Use these exact paths while working on the request.")
+        return f"{base_prompt}\n\n" + "\n".join(lines)
 
     def _build_startup_message(self) -> str:
         data = {
@@ -1092,9 +1231,9 @@ class Bridge:
                 message = upd.get("message")
                 if not isinstance(message, dict):
                     continue
-                text = message.get("text")
-                if not isinstance(text, str):
-                    continue
+                text_raw = message.get("text")
+                caption_raw = message.get("caption")
+                text = text_raw if isinstance(text_raw, str) else (caption_raw if isinstance(caption_raw, str) else "")
 
                 chat = message.get("chat") or {}
                 chat_id = chat.get("id")
@@ -1110,20 +1249,29 @@ class Bridge:
                             pass
                     continue
 
+                attachments, warnings = self._extract_telegram_attachments(message, chat_id)
+                if warnings:
+                    self._send_telegram_system(chat_id, "Failed to download some attachments:\n- " + "\n- ".join(warnings))
+
                 clean = text.strip()
-                if not clean:
+                if not clean and not attachments:
                     continue
 
-                if clean.startswith("/"):
+                if clean.startswith("/") and not attachments:
                     self._handle_telegram_command(chat_id, clean)
+                    continue
+
+                prompt = self._build_prompt_from_telegram_message(clean, attachments)
+                if not prompt:
                     continue
 
                 qsize = self._enqueue(
                     Task(
                         source="telegram",
-                        prompt=clean,
+                        prompt=prompt,
                         chat_id=chat_id,
                         message_id=message.get("message_id"),
+                        image_paths=[str(item["path"]) for item in attachments if bool(item.get("is_image"))],
                     )
                 )
 
@@ -1211,7 +1359,13 @@ class Bridge:
             self._save_state()
             self._log(f"Thread title applied: {self.thread_title}")
 
-    def _build_codex_cmd(self, prompt: str, *, last_message_file: Path) -> list[str]:
+    def _build_codex_cmd(
+        self,
+        prompt: str,
+        *,
+        last_message_file: Path,
+        image_paths: list[str] | None = None,
+    ) -> list[str]:
         common = [
             self.codex_bin,
             *self.codex_global_args,
@@ -1222,12 +1376,14 @@ class Bridge:
             "-o",
             str(last_message_file),
         ]
+        images = [str(x) for x in (image_paths or []) if str(x).strip()]
 
         if self.thread_id:
             # Resume the exact stored thread id for deterministic continuity.
             return [
                 *common,
                 "resume",
+                *sum((["--image", p] for p in images), []),
                 *self.codex_exec_args,
                 self.thread_id,
                 prompt,
@@ -1237,6 +1393,7 @@ class Bridge:
             *common,
             "-C",
             str(self.project_path),
+            *sum((["--image", p] for p in images), []),
             *self.codex_exec_args,
             prompt,
         ]
@@ -1462,12 +1619,13 @@ class Bridge:
         self,
         prompt: str,
         *,
+        image_paths: list[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> tuple[int, str, bool]:
         self._ensure_thread_title_applied()
         ts = int(time.time() * 1000)
         last_msg_file = self.state_dir / f"_tmp_last_msg_{self.profile_id}_{ts}.txt"
-        cmd = self._build_codex_cmd(prompt, last_message_file=last_msg_file)
+        cmd = self._build_codex_cmd(prompt, last_message_file=last_msg_file, image_paths=image_paths)
 
         self._log_verbose(f"Running codex (thread={self.thread_id or 'new'})")
 
@@ -1679,6 +1837,7 @@ class Bridge:
 
                 rc, final_text, interrupted = self._run_codex_task(
                     task.prompt,
+                    image_paths=task.image_paths,
                     progress_callback=progress_callback,
                 )
             except Exception as exc:

@@ -68,6 +68,14 @@ Available Telegram/local slash commands:
 - `/queue` - current queue size.
 - `/ping` - health check.
 
+Telegram file upload support:
+
+- `document` and `photo` attachments are downloaded automatically.
+- Files are saved locally under `telegram_uploads_dir` (default: `<project_path>/.bridge_uploads`).
+- Bridge appends saved file paths to the queued Codex prompt so the agent can read/process them.
+- Image attachments are additionally passed to Codex via `--image`, so instructions in caption/text are applied to the image directly.
+- Message caption (if present) is used as prompt text; without caption, bridge uses a default prompt to process uploaded files.
+
 Telegram command menu follows execution state:
 
 - While Codex is running: bridge tries to expose only `/esc`.
@@ -89,6 +97,8 @@ Important keys:
 - `codex_approval_policy` - optional approval mode: `untrusted` | `on-failure` | `on-request` | `never`. If omitted and `codex_permissions=danger-full-access`, bridge defaults to `never`.
 - `codex_web_search` - optional boolean. Enables CLI `--search` (web tool). If omitted and `codex_permissions=danger-full-access`, bridge defaults to `true`.
 - `thread_title` - optional thread title; bridge applies it via `/rename` and prefixes outgoing Telegram messages with `[thread_title]`.
+- `telegram_uploads_dir` - optional path for Telegram-uploaded files. Relative paths are resolved from `project_path`.
+- `telegram_max_file_bytes` - optional max attachment size (default `26214400` bytes = 25 MB).
 
 Default profile is portable and uses:
 
